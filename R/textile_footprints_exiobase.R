@@ -1,6 +1,4 @@
-##############################################################################################
-##  FABIO Footprints
-##############################################################################################
+# Textiles footprint exiobase
 
 library(Matrix)
 library(tidyverse)
@@ -21,61 +19,74 @@ E <- readRDS(file=paste0("/mnt/nfs_fineprint/tmp/exiobase/v3.8.2/pxp/IOT_",year,
 Y_codes <- readRDS(file="/mnt/nfs_fineprint/tmp/exiobase/v3.8.2/Y.codes.rds")
 Q_codes <- readRDS(file="/mnt/nfs_fineprint/tmp/exiobase/v3.8.2/Q.codes.rds")
 IO_codes <- readRDS(file="/mnt/nfs_fineprint/tmp/exiobase/v3.8.2/pxp/IO.codes.rds")
-
+exio_item_categories <- fread("input/exio_item_categories.csv")
 gwp <- as.numeric(colSums(E * Q_codes$GWP))
 
-# calculate footprints -------------------------------------------------------------------------
-country="EU27"
 
+# calculate multipliers -------------------------------------------------------------------------
 ext <- gwp / as.vector(X)
 ext[!is.finite(ext)] <- 0
 MP <- ext * L
+rm(L)
 
-# Prepare Final Demand -------------------------------------------------------------------------
-if(country=="EU27"){
-  Y_country <- Y[,Y_codes$Country.Name %in% unique(Y_codes$Country.Name)[1:27]]
-  colnames(Y_country) <- Y_codes$FD.Category[Y_codes$Country.Name %in% unique(Y_codes$Country.Name)[1:27]]
-  Y_country <- agg(Y_country)
-} else if(country=="World"){
-  Y_country <- Y
-  colnames(Y_country) <- Y_codes$FD.Category
-  Y_country <- agg(Y_country)
-} else {
-  Y_country <- Y[,Y_codes$Country.Name == country]
-  colnames(Y_country) <- Y_codesFD.Category[Y_codes$Country.Name == country]
-}
 
-#-------------------------------------------------------------------------
-# Calculate detailed Footprints
-#-------------------------------------------------------------------------
-FP <- t(t(MP) * rowSums(Y_country))
-colnames(FP) <- rownames(FP) <- paste0(IO_codes$Country.Code, "_", IO_codes$Product.Name)
-FP <- FP[, IO_codes$Product.Short %in% c("C_TEXT", "C_GARM", "C_LETH")]
+# calculate footprints -------------------------------------------------------------------------
+# country="EU-27"
+fp <- rbindlist(
+  lapply(c("EU-27", "world"), function(country){
+    
+    # prepare final demand -------------------------------------------------------------------------
+    if(country=="EU-27"){ Y_country <- Y[,Y_codes$Country.Name %in% unique(Y_codes$Country.Name)[1:27]]
+    } else { Y_country <- Y }
+    
+    FP <- t(t(MP) * rowSums(Y_country))
+    colnames(FP) <- rownames(FP) <- paste0(IO_codes$Country.Code, "_", IO_codes$Product.Name)
+    FP <- FP[, IO_codes$Product.Short %in% c("C_TEXT", "C_GARM", "C_LETH")]
+    FP <- as(FP, "dgTMatrix")
+    results <- data.table(origin=rownames(FP)[FP@i + 1], target=colnames(FP)[FP@j + 1], value=FP@x)
+    results[,`:=`(country_origin = substr(origin,1,2),
+                  item_origin_index = (FP@i + 1) %% 200,
+                  item_origin = substr(origin,4,100),
+                  final_product = substr(target,4,100),
+                  consumer = country)]
+    rm(FP)
+    # add auxiliary info on origin and target commodities
+    match_origin <- match(results$origin, paste0(IO_codes$Country.Code, "_", IO_codes$Product.Name))
+    results[,`:=`(
+      item_origin_short = IO_codes$Product.Short[match_origin],
+      continent_origin = IO_codes$Region.Code[match_origin],
+      item_origin_category = exio_item_categories$item_category[
+        match(results$item_origin, exio_item_categories$item_origin)]
+      )]
+    
+    # reorder and aggregate columns
+    results <- results %>%
+      select(-origin, -target, -country_origin) %>% 
+      filter(value != 0) %>% 
+      # relocate(c(consumer, continent_origin, item_origin_index, item_origin_short), .before = item_origin) %>%
+      # relocate(value, .after = final_product) %>% 
+      group_by(consumer, continent_origin, item_origin_index, item_origin_category, final_product) %>% 
+      summarize(value = sum(value, na.rm = TRUE), .groups = "drop")
+    
+  })
+)
 
-results <- FP %>%
-  as.matrix() %>% 
-  as_tibble() %>% 
-  mutate(origin = paste0(IO_codes$Country.Code, "_", IO_codes$Product.Name)) %>% 
-  gather(index, value, -origin) %>%
-  mutate(country_origin = substr(origin,1,2)) %>% 
-  mutate(item_origin = substr(origin,4,100)) %>% 
-  mutate(country_target = substr(index,1,2)) %>% 
-  mutate(final_product = substr(index,4,100)) %>% 
-  select(-index, -origin) %>% 
-  filter(value != 0) %>% 
-  filter(! item_origin %in% c())
+animal <- c("C_CATL", "C_PIGS", "C_PLTR", "C_OMEA", "C_OANP", "C_MILK", "C_WOOL", "C_MANC")
+crops <- c("C_PARI", "C_WHEA", "C_OCER", "C_FVEG", "C_OILS", "C_SUGB", "C_OTCR")
 
-results$item_origin_short <- IO_codes$Product.Short[match(results$item_origin, IO_codes$Product.Name)]
-
-data <- results %>%
-  filter(!item_origin_short %in% c("C_PARI", "C_WHEA", "C_OCER", "C_FVEG", "C_OILS", "C_SUGB", "C_FIBR", "C_OTCR", 
-                                   "C_CATL", "C_PIGS", "C_PLTR", "C_OMEA", "C_OANP", "C_MILK", "C_WOOL", "C_MANC")) %>% 
-  group_by(final_product, item_origin) %>%
+data <- fp %>%
+  # mutate(item_origin = ifelse(item_origin_short %in% crops, "Agriculture, other crops", 
+  #                             ifelse(item_origin_short == "C_FIBR", "Agriculture, fibre crops", 
+  #                                    ifelse(item_origin_short %in% animal, "Agriculture, animal products", 
+  #                                           item_origin)))) %>% 
+  # mutate(item_origin_index = ifelse(item_origin_index <= 15, 1, item_origin_index)) %>% 
+  group_by(consumer, continent_origin, item_origin_category, final_product) %>%
   summarise(value = round(sum(value))) %>%
   filter(value != 0) %>% 
   mutate(ghg_Gt = value * 10e-12, value = NULL)
 
-fwrite(data, file=paste0("./output/EXIOBASE_",country,"_",year,"_ghg.csv"), sep=",")
+fwrite(data, file=paste0("./output/textiles_footprints_EXIOBASE_",year,".csv"), sep=",")
+
 
 
 
